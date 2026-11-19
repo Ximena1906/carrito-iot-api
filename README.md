@@ -1,205 +1,259 @@
 # Carrito IoT API
 
-API en **Python + FastAPI** (programación orientada a objetos) para controlar un carrito RC con
-**ESP32 + 2× 74HC595 + PC817**. Usa la base de datos **`carrito_iot` en Amazon RDS (MySQL)**,
-integra los **21 Stored Procedures**, se documenta en **Swagger UI** y publica eventos en tiempo real
-por **WebSocket**.
+API en **Python + FastAPI** (programación orientada a objetos) para una empresa que comercializa
+vehículos IoT. Cubre las prácticas **4.1 CONTROL**, **4.2 MONITOREO** y **4.3 ADMINISTRACIÓN**:
+inventario de modelos y unidades físicas, clientes, asignaciones, permisos de soporte, editor de DEMO,
+pruebas temporales de Invitado, auditoría y dashboard. Usa la base **`carrito_iot` en Amazon RDS (MySQL)**
+solo mediante **procedimientos almacenados** (21 originales + 44 de administración), se documenta en
+**Swagger UI** y publica eventos en tiempo real por **WebSocket seguro (WSS)**.
 
 ```
-Thunder Client / Swagger / Página web ──HTTP(S)──► FastAPI ──► Stored Procedures ──► Amazon RDS
-                                         ◄──WS(S)──  (eventos por vehículo)  ──WS(S)──► ESP32
+GitHub Pages (CONTROL | MONITOREO | ADMINISTRACIÓN)
+        │  HTTPS + JWT                     ▲ WSS + JWT (solo unidades autorizadas)
+        ▼                                  │
+Caddy (Let's Encrypt) ──► FastAPI (EC2 Server2) ──► Stored Procedures ──► Amazon RDS
+                                   │
+                                   └── WSS + DISPOSITIVO_TOKEN ──► ESP32 (unidad 1)
 ```
 
 ---
 
-## 1. Estructura
+## 1. Roles y modelo de autorización
+
+| Rol | Quién es | Puede |
+|---|---|---|
+| **admin** | Empresa | Dashboard, modelos y capacidades, unidades, clientes, asignaciones, auditoría, DEMO de fábrica. Controla unidades de **exhibición** y **disponibles**. En unidades vendidas solo con **permiso de soporte** vigente otorgado por el comprador. |
+| **usuario** | Comprador | Solo **sus** unidades («Mis vehículos»): CONTROL, MONITOREO, historial, DEMO de fábrica y **sus DEMO privadas**; otorga/revoca soporte. |
+| **invitado** | Visitante sin cuenta | Catálogo público y **una prueba temporal** (180 s) de una unidad de exhibición con reserva exclusiva, comandos restringidos y duración máxima de 2 s por movimiento. |
+
+Además del rol, **cada ruta valida la unidad concreta** (`services/autorizacion.py`):
+
+| Respuesta | Cuándo |
+|---|---|
+| `401` | Sin token, token vencido/invalidado (logout, cuenta desactivada, contraseña restablecida) o prueba de Invitado terminada. |
+| `403` | Rol sin permiso (Invitado en administración, Usuario en `/admin`, Admin en unidad vendida sin soporte, comando no permitido al Invitado). |
+| `404` | Unidad ajena para un **Usuario** (no se revela que existe) o recurso inexistente. |
+| `409` | Unidad ocupada por otra sesión (control exclusivo), reserva de Invitado activa, DEMO en curso, duplicados, unidad inactiva. |
+| `429` | Límite de intentos (login 10/min por IP+cuenta, pruebas 6/min por IP, 40 comandos/10 s por sesión). |
+
+**Control exclusivo:** quien envía un comando «toma» la unidad durante `CONTROL_EXCLUSIVO_S` (20 s desde el
+último comando); otra sesión recibe `409`. **`DETENER` nunca se bloquea.**
+
+---
+
+## 2. Estructura
 
 ```
-carrito_iot_api/
+carrito-iot-api/
 ├── app/
-│   ├── main.py                 # Crea la app, CORS, Swagger, routers. Ejecuta Uvicorn.
-│   ├── dependencias.py         # Contenedor: crea una instancia de cada componente
+│   ├── main.py                    # App, CORS, Swagger, routers, tareas de fondo (vigilancia de Invitados)
+│   ├── dependencias.py            # Contenedor: una instancia de cada componente
 │   ├── core/
-│   │   ├── config.py           # Settings: lee .env (sin credenciales en código)
-│   │   ├── errores.py          # Excepciones de dominio -> códigos HTTP
-│   │   └── seguridad.py        # JWT, roles operador/admin, token del dispositivo
+│   │   ├── config.py              # Settings desde .env
+│   │   ├── errores.py             # Excepciones de dominio → 400/401/403/404/409/429/503
+│   │   ├── seguridad.py           # PBKDF2, JWT (versión de token), Actor, token del dispositivo
+│   │   ├── acceso.py              # Dependencias: actor_requerido, solo_admin, solo_usuario…
+│   │   └── limites.py             # Limitador en memoria (ventana deslizante)
 │   ├── db/
-│   │   ├── database.py         # Conexión PyMySQL, transacciones, traducción de errores
-│   │   └── procedimientos.py   # Los 21 SP (único lugar con SQL; parámetros enlazados)
-│   ├── models/esquemas.py      # Modelos Pydantic de entrada/salida y validaciones
+│   │   ├── database.py            # PyMySQL, transacciones, traducción de errores
+│   │   ├── procedimientos.py      # 21 SP originales
+│   │   └── procedimientos_admin.py# 44 SP de administración (4.3)
+│   ├── models/esquemas.py         # Pydantic: validación de entrada/salida
 │   ├── services/
-│   │   ├── catalogo.py         # Reglas de vehículos, comandos, estado/historial y DEMO
-│   │   └── control.py          # Movimiento individual (transacción) y ejecutor de DEMO
-│   ├── websocket/gestor.py     # Clientes WS por vehículo, difusión de eventos
-│   └── routers/                # Endpoints HTTP y WebSocket (sin lógica de persistencia)
-│       ├── sistema.py          # /health, /health/db, /auth/login
-│       ├── vehiculos.py        # vehículos, comandos, estado, historial
-│       ├── demos.py            # DEMO y movimientos de DEMO
-│       ├── control.py          # ejecutar movimiento, iniciar/cancelar DEMO
-│       └── websocket.py        # /ws/vehiculos/{id}
+│   │   ├── usuarios.py            # Login, bloqueo tras 5 fallos, cuentas, admin inicial
+│   │   ├── identidad.py           # Token → Actor (cuenta o sesión de Invitado)
+│   │   ├── autorizacion.py        # Nivel sobre la unidad: propietario/soporte/empresa/invitado
+│   │   ├── inventario.py          # Modelos, capacidades, unidades, asignaciones, soporte, dashboard
+│   │   ├── demos_editor.py        # DEMO de fábrica/privadas con validación en servidor
+│   │   ├── invitados.py           # Reserva exclusiva, expiración, gracia de desconexión, DETENER seguro
+│   │   ├── conexiones.py          # Revalida/cierra sockets cuando cambian los permisos
+│   │   ├── auditoria.py           # Registro de acciones y rechazos
+│   │   ├── catalogo.py            # Reglas 4.1 de vehículos, comandos, estado, historial
+│   │   └── control.py             # Movimiento (transacción), control exclusivo, ejecutor de DEMO
+│   ├── websocket/gestor.py        # Suscriptores por unidad con su identidad
+│   └── routers/
+│       ├── sistema.py             # /health, /auth/login, /auth/logout, /auth/yo
+│       ├── publico.py             # /catalogo, /invitados/…
+│       ├── admin.py               # /admin/…
+│       ├── mis_vehiculos.py       # /mis-vehiculos/…
+│       ├── control.py             # movimientos, iniciar/cancelar DEMO
+│       ├── vehiculos.py           # comandos, estado, historial (4.1/4.2, ahora autorizados)
+│       ├── demos.py               # editor de DEMO + rutas heredadas
+│       └── websocket.py           # /ws/vehiculos/{id}?token=
+├── database/
+│   ├── 01…05_*.sql                # Esquema y SP originales (4.1)
+│   └── migraciones/               # 4.3: V000–V006, verificación y reversión (ver §6)
+├── tests/test_practica43.py       # Pruebas P01–P17 contra una API en ejecución
+├── deploy/instalar_server2.ps1    # Servicios WinSW (API + Caddy) en EC2
 ├── requirements.txt
-├── .env.example                # Plantilla de configuración SIN secretos
-└── .gitignore                  # Excluye .venv, .env, cachés
+└── .env.example                   # Plantilla SIN secretos
 ```
 
 ---
 
-## 2. Ejecución local (Windows + VS Code)
+## 3. Ejecución local
 
 ```powershell
 cd C:\carrito_iot_api
 python -m venv .venv
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass   # solo si PowerShell bloquea scripts
 .\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
 pip install -r requirements.txt
-copy .env.example .env        # y edita .env con tus datos reales
+copy .env.example .env        # edita .env con tus datos reales (nunca se sube a Git)
 python -m app.main
 ```
 
-* API: <http://localhost:8000>
-* Swagger UI: <http://localhost:8000/docs>
-* WebSocket: `ws://localhost:8000/ws/vehiculos/1`
+* Swagger UI: <http://localhost:8000/docs> → **Authorize** con usuario y contraseña de una cuenta.
+* Al arrancar, si no existe ningún administrador, se crea con `ADMIN_USUARIO` / `ADMIN_PASSWORD` / `ADMIN_NOMBRE`.
+  Los compradores se dan de alta desde ADMINISTRACIÓN (`POST /admin/usuarios`).
 
-> Requisito de red: el Security Group de RDS debe permitir **TCP 3306 desde Mi IP**.
+### Variables nuevas en 4.3
+
+| Variable | Defecto | Uso |
+|---|---|---|
+| `ADMIN_NOMBRE` | Administrador de la empresa | Nombre de la cuenta inicial |
+| `DISPOSITIVO_ID_VEHICULO` | 1 | Única unidad en la que vale `DISPOSITIVO_TOKEN` |
+| `INVITADO_SEGUNDOS` | 180 | Duración de la prueba |
+| `INVITADO_DURACION_MAX_MS` | 2000 | Máximo por movimiento del Invitado |
+| `INVITADO_GRACIA_DESCONEXION_S` | 15 | Tiempo para reconectar antes de cerrar la prueba |
+| `CONTROL_EXCLUSIVO_S` | 20 | Ventana de control exclusivo |
+| `SOPORTE_MINUTOS_MAX` | 240 | Máximo de un permiso de soporte |
+| `DEMO_MAX_PASOS` / `DEMO_MAX_TOTAL_MS` | 30 / 120000 | Límites del editor de DEMO |
+
+`OPERADOR_USUARIO` / `OPERADOR_PASSWORD` (4.1) ya no se usan; pueden quedarse en `.env` sin efecto.
 
 ---
 
-## 3. Seguridad
+## 4. Endpoints
 
-| Qué | Cómo |
+### Sesión y público
+| Método | Ruta | Acceso |
+|---|---|---|
+| GET | `/health`, `/health/db` | público |
+| POST | `/auth/login` (form `username`, `password`) | público |
+| POST | `/auth/logout` (invalida todos los tokens de la cuenta) | cuenta |
+| GET | `/auth/yo` | cualquiera con token |
+| GET | `/catalogo` | público |
+| POST | `/invitados/sesiones` `{"id_vehiculo":1}` → token de Invitado | público |
+| GET / DELETE | `/invitados/sesion` | invitado |
+
+### Administración (`admin`)
+| Método | Ruta |
 |---|---|
-| Credenciales de RDS | Solo en `.env` (excluido de Git). Usuario `api_carrito` con permiso **EXECUTE** únicamente (`database/05_usuario_api.sql`). |
-| SQL | Solo `CALL sp_...(%s, ...)` con parámetros enlazados; nunca concatenación. |
-| GET | Públicos y de solo lectura. |
-| Movimientos y DEMO | Requieren token con rol **operador** o **admin**. |
-| Crear / actualizar / eliminar | Requieren rol **admin**. |
-| ESP32 | Se conecta al WS con `?token=DISPOSITIVO_TOKEN`. |
-| CORS | Solo los orígenes de `CORS_ORIGENES` (CORS no es autenticación). |
-| Errores | 500 genérico al cliente; el detalle solo se registra en el servidor. |
+| GET | `/admin/dashboard` |
+| GET, POST | `/admin/modelos` · GET, PUT `/admin/modelos/{id}` · PATCH `/admin/modelos/{id}/estado` · PUT `/admin/modelos/{id}/capacidades` |
+| GET, POST | `/admin/unidades` · GET, PUT `/admin/unidades/{id}` · PATCH `/admin/unidades/{id}/estado` |
+| PUT, DELETE | `/admin/unidades/{id}/propietario` (asignar/reasignar · liberar) |
+| GET, POST | `/admin/usuarios` · GET, PUT `/admin/usuarios/{id}` · PATCH `…/estado` · PUT `…/password` |
+| GET | `/admin/auditoria?actor_tipo=&accion=&resultado=&limite=&desplazamiento=` |
 
-**Obtener token:** `POST /auth/login` con *form-data* `username` y `password`.
-En Swagger: botón **Authorize**. En Thunder Client: pestaña *Auth → Bearer* con el `access_token`.
+### Comprador (`usuario`)
+| Método | Ruta |
+|---|---|
+| GET | `/mis-vehiculos` |
+| PUT, DELETE | `/mis-vehiculos/{id}/soporte` `{"minutos":30}` |
 
----
+### Unidad (autorizado por unidad)
+| Método | Ruta | Notas |
+|---|---|---|
+| GET | `/vehiculos/{id}`, `/comandos`, `/estado`, `/historial?limite=10` | lectura |
+| POST | `/vehiculos/{id}/movimientos` | `sp_actualizar_estado` + `sp_registrar_historial` en 1 transacción |
+| GET, POST | `/vehiculos/{id}/demos` | fábrica + propias; crear: admin → fábrica, usuario → privada |
+| GET, PUT, DELETE | `/vehiculos/{id}/demos/{id_demo}` | detalle con pasos · guardar (1 transacción) · baja lógica |
+| POST | `/vehiculos/{id}/demos/{id_demo}/iniciar`, `/demos/cancelar` · GET `/demos/en-curso` | |
+| GET | `/vehiculos` | admin (inventario completo) |
 
-## 4. Endpoints y Stored Procedures
-
-| Método | Ruta | SP | Rol |
-|---|---|---|---|
-| GET | `/health` | — | público |
-| GET | `/health/db` | `SELECT 1` en RDS | público |
-| POST | `/auth/login` | — | público |
-| GET | `/vehiculos` | sp_obtener_vehiculos | público |
-| GET | `/vehiculos/{id}` | sp_obtener_vehiculo | público |
-| POST | `/vehiculos` | sp_crear_vehiculo | admin |
-| POST | `/vehiculos/{id}/actualizar` | sp_actualizar_vehiculo | admin |
-| POST | `/vehiculos/{id}/eliminar` | sp_eliminar_vehiculo | admin |
-| GET | `/vehiculos/{id}/comandos` | sp_obtener_comandos_vehiculo | público |
-| POST | `/vehiculos/{id}/comandos` | sp_crear_comando | admin |
-| POST | `/vehiculos/{id}/comandos/{id_comando}/actualizar` | sp_actualizar_comando | admin |
-| POST | `/vehiculos/{id}/comandos/{id_comando}/eliminar` | sp_eliminar_comando | admin |
-| GET | `/vehiculos/{id}/estado` | sp_obtener_estado | público |
-| GET | `/vehiculos/{id}/historial?limite=10` | sp_obtener_historial (máx. 10) | público |
-| **POST** | **`/vehiculos/{id}/movimientos`** | **sp_actualizar_estado + sp_registrar_historial (1 transacción)** | operador |
-| GET | `/vehiculos/{id}/demos` | sp_obtener_demos | público |
-| POST | `/vehiculos/{id}/demos` | sp_crear_demo | admin |
-| POST | `/vehiculos/{id}/demos/{id_demo}/actualizar` | sp_actualizar_demo | admin |
-| POST | `/vehiculos/{id}/demos/{id_demo}/eliminar` | sp_eliminar_demo | admin |
-| GET | `/vehiculos/{id}/demos/{id_demo}/movimientos` | sp_obtener_movimientos_demo | público |
-| POST | `/vehiculos/{id}/demos/{id_demo}/movimientos` | sp_agregar_movimiento_demo | admin |
-| POST | `/vehiculos/{id}/demos/{id_demo}/movimientos/{id_mov}/actualizar` | sp_actualizar_movimiento_demo | admin |
-| POST | `/vehiculos/{id}/demos/{id_demo}/movimientos/{id_mov}/eliminar` | sp_eliminar_movimiento_demo | admin |
-| **POST** | **`/vehiculos/{id}/demos/{id_demo}/iniciar`** | sp_obtener_movimientos_demo + sp_actualizar_estado (sin historial) | operador |
-| POST | `/vehiculos/{id}/demos/cancelar` | sp_actualizar_estado (DETENER) | operador |
-| GET | `/vehiculos/{id}/demos/en-curso` | — (memoria del servidor) | público |
-
-Los **21 SP** quedan integrados: vehículos (5), comandos (4), estado (2), historial (2), DEMO (4) y
-movimientos de DEMO (4).
-
-### Códigos HTTP
-`200` OK · `201` creado · `202` DEMO aceptada · `400` DEMO sin movimientos / referencia inexistente ·
-`401` sin token o token inválido · `403` rol sin permiso · `404` vehículo, comando o DEMO inexistente
-(o que no pertenece al vehículo) · `409` duplicado, registro en uso, vehículo/comando inactivo o DEMO en
-curso · `422` datos inválidos · `500` error interno · `503` RDS no disponible.
-
-### Ejemplo: movimiento individual
-```http
-POST /vehiculos/1/movimientos
-Authorization: Bearer <token>
-Content-Type: application/json
-
-{ "comando": "AVANZAR", "duracion_ms": 2000, "origen": "THUNDER" }
-```
-También se acepta `{ "codigo": 1 }`. `duracion_ms` (50–10000, por defecto 1000) es el **tiempo máximo**
-que el ESP32 mantendrá activa la salida; `DETENER` libera todo antes.
+Las rutas heredadas de 4.1 (`…/actualizar`, `…/eliminar`, `…/movimientos/{id}/…`) siguen funcionando con las
+mismas validaciones. `POST /vehiculos` queda obsoleto (409 → usar `/admin/unidades`).
 
 ---
 
 ## 5. WebSocket
 
-**URL:** `ws://<host>:8000/ws/vehiculos/{id_vehiculo}` (en AWS con HTTPS: `wss://<dominio>/ws/vehiculos/{id}`)
+`wss://<dominio>/ws/vehiculos/{id}?token=<JWT>`
 
-| Cliente | Conexión |
+| Cliente | Token |
 |---|---|
-| Monitoreo (navegador, Thunder Client) | `/ws/vehiculos/1` |
-| Dispositivo ESP32 | `/ws/vehiculos/1?token=<DISPOSITIVO_TOKEN>` |
+| Navegador / Thunder Client | JWT de la sesión (admin, usuario o invitado). Misma autorización que REST. |
+| ESP32 | `DISPOSITIVO_TOKEN`, válido solo en la unidad `DISPOSITIVO_ID_VEHICULO`. |
 
-* Cada cliente recibe **solo** los eventos de su vehículo. Se admiten varios clientes simultáneos.
-* Al conectarse se recibe `estado_inicial` (último estado guardado en RDS). **No es una orden nueva.**
-* Todo evento lleva `tipo`, `id_evento` (único), `id_vehiculo` y `timestamp` (UTC).
-* El ESP32 marca `conectado = 1` en `estado_vehiculo` mientras su sesión está abierta.
+* Sin token: evento `error` (codigo 401) y cierre **4401**. Sin permiso: `error` + cierre **4403**/**4404**.
+* Cuando cambian los permisos (reasignación, liberación, soporte revocado o vencido, logout, cuenta
+  desactivada) el servidor envía `acceso_revocado` y cierra con **4403**.
+* Eventos: `estado_inicial`, `movimiento`, `demo_inicio`, `demo_paso`, `demo_fin`, `demo_cancelada`,
+  `dispositivo`, `ack_dispositivo`, `sesion_invitado` (`estado: finalizada`, `motivo: CERRADA | EXPIRADA |
+  DESCONEXION`), `acceso_revocado`, `error`, `pong`.
+* Las órdenes **nunca** entran por WebSocket; solo `ping` y el `ack` del ESP32.
 
-### Eventos que envía el servidor
-
-```jsonc
-// Al conectarse
-{"tipo":"estado_inicial","id_evento":"…","id_vehiculo":1,"vehiculo":"Carrito IoT","id_comando":9,
- "comando":"DETENER","codigo":9,"fecha_actualizacion":"…","dispositivo_conectado":false,
- "demo_en_curso":null,"timestamp":"…"}
-
-// POST /movimientos válido (se guarda en historial)
-{"tipo":"movimiento","id_evento":"…","id_vehiculo":1,"id_comando":1,"comando":"AVANZAR","codigo":1,
- "duracion_ms":2000,"origen":"THUNDER","timestamp":"…"}
-
-// DEMO (NO se guarda en historial)
-{"tipo":"demo_inicio","id_evento":"…","id_vehiculo":1,"id_demo":1,"nombre":"Demo principal","total_pasos":8,"origen":"API","timestamp":"…"}
-{"tipo":"demo_paso","id_evento":"…","id_vehiculo":1,"id_demo":1,"paso":1,"total_pasos":8,"orden":1,
- "id_comando":1,"comando":"AVANZAR","codigo":1,"duracion_ms":2000,"pausa_ms":400,"timestamp":"…"}
-{"tipo":"demo_fin","id_evento":"…","id_vehiculo":1,"id_demo":1,"nombre":"Demo principal","total_pasos":8,"timestamp":"…"}
-{"tipo":"demo_cancelada","id_evento":"…","id_vehiculo":1,"id_demo":1,"nombre":"Demo principal","total_pasos":8,
- "motivo":"CANCELADA_POR_USUARIO | DETENER | ERROR","timestamp":"…"}
-
-// Presencia del ESP32
-{"tipo":"dispositivo","id_evento":"…","id_vehiculo":1,"conectado":true,"timestamp":"…"}
-
-// Confirmación de recepción enviada por el ESP32 (no prueba movimiento físico)
-{"tipo":"ack_dispositivo","id_evento":"…","id_vehiculo":1,"id_evento_ref":"…","resultado":"ejecutado","timestamp":"…"}
-
-// Errores
-{"tipo":"error","id_evento":"…","id_vehiculo":1,"contexto":"demo","mensaje":"…","timestamp":"…"}
-```
-
-### Mensajes que acepta el servidor
-```json
-{"tipo":"ping"}                                              // responde {"tipo":"pong",...}
-{"tipo":"ack","id_evento_ref":"<id_evento>","resultado":"ejecutado"}   // solo del ESP32
-```
-Las órdenes **nunca** entran por WebSocket: solo por `POST`.
-
-### Reglas de DEMO
-* Pasos leídos de `sp_obtener_movimientos_demo`, en orden, esperando `duracion_ms + pausa_ms` entre pasos.
-* Actualiza `estado_vehiculo` en cada paso, **nunca** llama a `sp_registrar_historial`.
-* Solo una DEMO por vehículo (409 si ya hay una).
-* Durante la DEMO solo se acepta el movimiento `DETENER`, que la cancela de inmediato.
-* La DEMO se ejecuta en segundo plano: no bloquea otras peticiones ni conexiones.
+**Fin seguro de la prueba de Invitado:** al cerrar, vencer o perder la conexión más de 15 s, el servidor
+cancela la DEMO en curso, registra `DETENER` con origen `SISTEMA`, lo publica al ESP32, libera la reserva y
+cierra los sockets del Invitado (4401).
 
 ---
 
-## 6. Pruebas funcionales con Thunder Client
+## 6. Migración de la base de datos (4.3)
 
-1. **POST** – `POST /auth/login` → copiar token → `POST /vehiculos/1/movimientos` con
-   `{"comando":"AVANZAR"}` → verificar `GET /vehiculos/1/estado` y el nuevo registro en historial.
-2. **GET** – `GET /vehiculos/1/historial` → máximo 10 registros, del más reciente al más antiguo.
-3. **WebSocket** – conectar `ws://localhost:8000/ws/vehiculos/1` → `POST /vehiculos/1/demos/1/iniciar`
-   → observar `demo_inicio`, 8 `demo_paso` y `demo_fin` → comparar historial antes/después (sin cambios).
+Scripts en `database/migraciones/`, **idempotentes** (se pueden repetir) y registrados en
+`migraciones_esquema`:
+
+| Archivo | Contenido |
+|---|---|
+| `00_inventario.sql` | Solo lectura: tablas, conteos, índices y SP antes de migrar |
+| `V000` | Tabla `migraciones_esquema` y procedimientos auxiliares `mig_*` |
+| `V001` | `usuarios`, `modelos`, `modelo_comandos` (capacidades) |
+| `V002` | `vehiculos` → unidad física (serie, modelo, estado comercial, propietario), `asignaciones`, `permisos_soporte` |
+| `V003` | `demos.tipo` (fabrica/privada) y `id_propietario` |
+| `V004` | `sesiones_invitado` (reserva exclusiva por índice único) y `auditoria` |
+| `V005` | Datos existentes: modelo desde `vehiculos.modelo`, capacidades desde `comandos`, unidad 1 = `UNI-0001` en **exhibición**, DEMO existentes = fábrica |
+| `V006` | 44 procedimientos de administración |
+| `99_verificacion.sql` | Debe mostrar 65 SP y 0 inconsistencias |
+| `reversion/R006…R000` | Reversión completa al esquema 4.2 |
+
+Orden: **respaldo (`mysqldump`) → 00 → V000…V006 → 99**. Las tablas e IDs de 4.1/4.2 se conservan
+(`id_vehiculo`, `id_comando`, historial y DEMO), por eso CONTROL y MONITOREO siguen funcionando.
+El usuario `api_carrito` sigue teniendo **solo EXECUTE**.
+
+---
+
+## 7. Seguridad
+
+| Qué | Cómo |
+|---|---|
+| Contraseñas | PBKDF2-SHA256 (390 000 iteraciones) con sal; nunca se devuelven. Bloqueo de 5 min tras 5 fallos. Mensaje de error genérico. |
+| Tokens | JWT con `version_token`: logout, desactivar la cuenta o restablecer la contraseña invalidan los tokens anteriores. |
+| SQL | Solo `CALL sp_…(%s…)` con parámetros enlazados. |
+| Auditoría | Logins, altas, cambios, asignaciones, soporte, DEMO, pruebas y **rechazos** (`/admin/auditoria`). |
+| Secretos | Solo en `.env` (excluido de Git). |
+| CORS | Orígenes de `CORS_ORIGENES`; WebSocket se autoriza con token porque CORS no aplica. |
+
+---
+
+## 8. Pruebas
+
+```powershell
+# API de prueba con prueba corta de Invitado (nunca contra datos reales)
+$env:INVITADO_SEGUNDOS=10; $env:INVITADO_GRACIA_DESCONEXION_S=3; python -m app.main
+# En otra terminal
+$env:API_URL="http://localhost:8000"; $env:ADMIN_PASSWORD="<contraseña admin>"; $env:INVITADO_GRACIA_DESCONEXION_S=3
+pip install pytest pytest-timeout httpx websockets
+pytest -v tests/test_practica43.py
+```
+
+| Prueba | Verifica |
+|---|---|
+| P01 | Login admin, credenciales inválidas (401 genérico), rutas protegidas |
+| P02 | Alta de unidad, serie duplicada (409), comandos desde capacidades |
+| P03 | Alta de cliente, usuario duplicado, sin exponer contraseñas |
+| P04 | Asignación, reasignación con revocación inmediata |
+| P05 | Aislamiento de comprador (404 en unidad ajena, 403 en `/admin`) |
+| P06 | Control del propietario; admin sin soporte (403) y con soporte |
+| P07 | WSS: 4401 sin token, rechazo de ajeno, eventos de la unidad |
+| P08 | Historial máximo 10 |
+| P09 | DEMO privada persistente, validación, reordenar pasos |
+| P10 | Ejecución, 409 por DEMO en curso, cancelación, fin |
+| P11 | Prueba de Invitado: comandos restringidos, duración recortada, fin seguro |
+| P12 | Rechazos al Invitado y al Admin durante la prueba |
+| P13 | Rechazo de vehículo ajeno en todas las rutas |
+| P14 | Exclusividad de la reserva (409) |
+| P15 | Reconexión, revocación por WSS (4403), gracia de desconexión y expiración con DETENER |
+| P16 | Responsive (pruebas del frontend) |
+| P17 | Auditoría (acciones y rechazos) y dashboard |

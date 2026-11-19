@@ -8,14 +8,20 @@ Reglas:
     pero NUNCA llama a sp_registrar_historial.
   * No se permiten dos DEMO simultáneas por vehículo. DETENER cancela la DEMO
     en curso y tiene prioridad.
+  * 4.3: control EXCLUSIVO por sesión. Quien envía un comando «toma» la unidad
+    durante CONTROL_EXCLUSIVO_S; otra sesión recibe 409 hasta que se libere.
+    DETENER nunca se bloquea (seguridad física). El Invitado solo usa los
+    comandos permitidos de su modelo y con duración limitada.
 """
 import asyncio
 import logging
+import time
 
 from fastapi.concurrency import run_in_threadpool
 
 from app.core.config import Settings
-from app.core.errores import Conflicto, SolicitudInvalida
+from app.core.errores import Conflicto, Prohibido, SolicitudInvalida
+from app.core.seguridad import Actor
 from app.db.database import Database
 from app.db.procedimientos import Fila, ProcedimientosAlmacenados
 from app.services.catalogo import ServicioComandos, ServicioDemos, ServicioVehiculos
@@ -127,6 +133,24 @@ class ServicioControl:
         self._demos = demos
         self._gestor = gestor
         self._ejecutor = ejecutor
+        self._exclusivo: dict[int, tuple[str, float]] = {}
+
+    # --------------------------------------------------- control exclusivo
+    def ocupada_por_otro(self, id_vehiculo: int, clave: str | None) -> bool:
+        actual = self._exclusivo.get(id_vehiculo)
+        return bool(actual and actual[0] != clave and actual[1] > time.monotonic())
+
+    def _tomar(self, id_vehiculo: int, clave: str, es_detener: bool, extra_s: float = 0) -> None:
+        if self.ocupada_por_otro(id_vehiculo, clave):
+            if es_detener:
+                return  # DETENER siempre pasa, pero no roba el control
+            raise Conflicto("La unidad está siendo controlada por otra sesión. Intenta de nuevo en unos segundos.")
+        self._exclusivo[id_vehiculo] = (clave, time.monotonic() + self._s.control_exclusivo_s + extra_s)
+
+    def liberar(self, id_vehiculo: int, clave: str | None = None) -> None:
+        actual = self._exclusivo.get(id_vehiculo)
+        if actual and (clave is None or actual[0] == clave):
+            self._exclusivo.pop(id_vehiculo, None)
 
     # ------------------------------------------------- movimiento individual
     def _persistir_movimiento(self, id_vehiculo: int, id_comando: int, conectado: bool, origen: str) -> None:
@@ -134,43 +158,58 @@ class ServicioControl:
             self._sp.actualizar_estado(id_vehiculo, id_comando, conectado, conn=conn)
             self._sp.registrar_historial(id_vehiculo, id_comando, origen, conn=conn)
 
-    async def ejecutar_movimiento(self, id_vehiculo: int, solicitud) -> dict:
+    async def ejecutar_movimiento(self, id_vehiculo: int, solicitud, actor: Actor | None = None,
+                                  nivel: str | None = None, capacidades: dict | None = None) -> dict:
         await run_in_threadpool(self._vehiculos.obtener_activo, id_vehiculo)
         comando = await run_in_threadpool(
             self._comandos.resolver_activo, id_vehiculo, solicitud.comando, solicitud.codigo
         )
+        es_detener = comando["nombre"] == COMANDO_DETENER
+        tope = self._s.duracion_max_ms
+        origen = solicitud.origen
+        if capacidades is not None:  # capacidades reales del modelo de la unidad
+            cap = capacidades.get(comando["codigo"])
+            if cap is None or not cap["activo"]:
+                raise Conflicto(f"El modelo de esta unidad no admite el comando {comando['nombre']}")
+            tope = min(tope, int(cap["duracion_max_ms"]))
+            if actor is not None and actor.es_invitado:
+                if not cap["permitido_invitado"] and not es_detener:
+                    raise Prohibido(f"El comando {comando['nombre']} no está disponible en la prueba de Invitado")
+                tope = min(tope, self._s.invitado_duracion_max_ms)
+        if actor is not None:
+            self._tomar(id_vehiculo, actor.clave, es_detener)
+            origen = "INVITADO" if actor.es_invitado else ("SOPORTE" if nivel == "soporte" else origen)
 
         demo_cancelada = False
         if self._ejecutor.demo_en_curso(id_vehiculo):
-            if comando["nombre"] != COMANDO_DETENER:
+            if not es_detener:
                 raise Conflicto("Hay una DEMO en ejecución: use DETENER o cancele la DEMO antes de mover")
             await self._ejecutor.cancelar(id_vehiculo, "DETENER")
             demo_cancelada = True
 
-        duracion = min(solicitud.duracion_ms or self._s.duracion_default_ms, self._s.duracion_max_ms)
+        duracion = min(solicitud.duracion_ms or self._s.duracion_default_ms, tope)
         conectado = self._gestor.dispositivo_conectado(id_vehiculo)
 
         # Transacción confirmada en RDS ANTES de notificar por WebSocket
-        await run_in_threadpool(
-            self._persistir_movimiento, id_vehiculo, comando["id_comando"], conectado, solicitud.origen
-        )
+        await run_in_threadpool(self._persistir_movimiento, id_vehiculo, comando["id_comando"], conectado, origen)
 
         evento = crear_evento(
             "movimiento", id_vehiculo,
             id_comando=comando["id_comando"], comando=comando["nombre"], codigo=comando["codigo"],
-            duracion_ms=duracion, origen=solicitud.origen,
+            duracion_ms=duracion, origen=origen,
         )
         enviados = await self._gestor.publicar(id_vehiculo, evento)
         return {
             "id_evento": evento["id_evento"], "id_vehiculo": id_vehiculo,
             "id_comando": comando["id_comando"], "comando": comando["nombre"], "codigo": comando["codigo"],
-            "duracion_ms": duracion, "origen": solicitud.origen, "timestamp": evento["timestamp"],
+            "duracion_ms": duracion, "origen": origen, "timestamp": evento["timestamp"],
             "clientes_notificados": enviados, "dispositivo_conectado": conectado,
             "demo_cancelada": demo_cancelada,
         }
 
     # ------------------------------------------------------------------ DEMO
-    async def iniciar_demo(self, id_vehiculo: int, id_demo: int, origen: str) -> dict:
+    async def iniciar_demo(self, id_vehiculo: int, id_demo: int, origen: str, actor: Actor | None = None,
+                           segundos_disponibles: int | None = None) -> dict:
         await run_in_threadpool(self._vehiculos.obtener_activo, id_vehiculo)
         demo = await run_in_threadpool(self._demos.obtener, id_vehiculo, id_demo)
         if not demo["activo"]:
@@ -178,10 +217,35 @@ class ServicioControl:
         pasos = await run_in_threadpool(self._sp.obtener_movimientos_demo, id_demo)
         if not pasos:
             raise SolicitudInvalida(f"La DEMO {id_demo} no tiene movimientos registrados")
+        total_s = sum(p["duracion_ms"] + p["pausa_ms"] for p in pasos) / 1000
+        if segundos_disponibles is not None and total_s > segundos_disponibles:
+            raise Conflicto(f"La DEMO dura {total_s:.0f} s y a tu sesión le quedan {segundos_disponibles} s")
         detener = await run_in_threadpool(self._comandos.buscar_por_nombre, id_vehiculo, COMANDO_DETENER)
+        if actor is not None:
+            self._tomar(id_vehiculo, actor.clave, False, extra_s=total_s)
+            origen = "INVITADO" if actor.es_invitado else origen
         await self._ejecutor.iniciar(id_vehiculo, demo, pasos, detener["id_comando"] if detener else None, origen)
         return {"estado": "en_curso", "id_vehiculo": id_vehiculo, "id_demo": id_demo,
                 "nombre": demo["nombre"], "total_pasos": len(pasos)}
+
+    async def detener_por_sistema(self, id_vehiculo: int, motivo: str) -> None:
+        """Detención segura al terminar una sesión (expiración, cierre o desconexión)."""
+        try:
+            await self._ejecutor.cancelar(id_vehiculo, motivo)
+            detener = await run_in_threadpool(self._comandos.buscar_por_nombre, id_vehiculo, COMANDO_DETENER)
+            if detener is None:
+                return
+            conectado = self._gestor.dispositivo_conectado(id_vehiculo)
+            await run_in_threadpool(self._persistir_movimiento, id_vehiculo, detener["id_comando"], conectado,
+                                    "SISTEMA")
+            await self._gestor.publicar(id_vehiculo, crear_evento(
+                "movimiento", id_vehiculo, id_comando=detener["id_comando"], comando=detener["nombre"],
+                codigo=detener["codigo"], duracion_ms=0, origen="SISTEMA", motivo=motivo,
+            ))
+        except Exception as exc:
+            log.warning("No se pudo detener la unidad %s (%s): %s", id_vehiculo, motivo, exc)
+        finally:
+            self.liberar(id_vehiculo)
 
     async def cancelar_demo(self, id_vehiculo: int) -> dict:
         await run_in_threadpool(self._vehiculos.obtener, id_vehiculo)

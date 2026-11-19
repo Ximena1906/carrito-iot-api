@@ -5,3 +5,6 @@ __pycache__/
 .env
 *.log
 logs/
+
+# Respaldos de la base (contienen datos reales)
+database/respaldos/
